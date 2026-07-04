@@ -27,3 +27,4 @@ tests/test_kv_cache.py
 tests/test_qjl.py
 tests/test_quant_linear.py
 tests/test_rotation.py
+tests/test_serve.py

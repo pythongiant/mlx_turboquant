@@ -61,29 +61,73 @@ turboquant generate --model ./qwen3-tq4 --prompt "Why is the sky blue?"
 ## Serve (OpenAI-compatible HTTP API)
 
 `turboquant serve` wraps `mlx_lm.server`: it installs the TurboQuant hooks (so a
-TurboQuant-quantized model dir loads through the stock server) and, optionally,
-swaps in the rotated TurboQuant KV cache — then forwards every other flag to
-`mlx_lm.server`.
+TurboQuant-quantized model dir loads through the stock server), optionally swaps
+in the rotated TurboQuant KV cache, then forwards every other flag straight to
+`mlx_lm.server`. The result is a drop-in OpenAI-compatible endpoint.
 
 ```sh
-# Serve a TurboQuant weight-quantized model (all mlx_lm.server flags pass through)
+# Weight-quantized TurboQuant model (all mlx_lm.server flags pass through)
 turboquant serve --model ./qwen3-tq4 --port 8080
 
 # ...plus the rotated 4-bit KV cache, with the unbiased 1-bit QJL residual
 turboquant serve --model ./qwen3-tq4 --port 8080 --kv-bits 4 --qjl
 ```
 
-Then call it like any OpenAI endpoint:
+**TurboQuant-specific flags** (everything else — `--host`, `--port`,
+`--adapter-path`, `--temp`, `--max-tokens`, `--trust-remote-code`, … — is parsed
+by `mlx_lm.server`; run `turboquant serve --help` for the full list):
+
+| flag | default | effect |
+|---|---|---|
+| `--kv-bits N` | off | enable the rotated TurboQuant KV cache at N bits (omit → normal fp16 cache) |
+| `--kv-group-size N` | 64 | KV quantization group size |
+| `--qjl` | off | add the unbiased 1-bit QJL residual estimator (near-fp16 scores at low KV bits) |
+
+**Endpoints** (served by `mlx_lm.server`): `POST /v1/chat/completions`,
+`POST /v1/completions`, `GET /v1/models`.
+
+> **Model id gotcha:** the `model` field in each request must match the server's
+> `--model` (the exact path or HF repo id). A short/renamed id makes the server
+> try to *load that as a new model* from the Hub (→ 401 "Repository Not Found").
+> Use the same string you launched with, or omit `model` to use the default.
+
+### Call it
 
 ```sh
-curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model": "./qwen3-tq4", "messages": [{"role":"user","content":"Hello!"}]}'
+# non-streaming
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "./qwen3-tq4",
+  "messages": [{"role": "user", "content": "Name two primary colors."}],
+  "max_tokens": 64, "temperature": 0.0
+}'
+
+# streaming (Server-Sent Events)
+curl -N http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
+  "model": "./qwen3-tq4",
+  "messages": [{"role": "user", "content": "Count to five."}],
+  "stream": true
+}'
 ```
 
-`--kv-bits` / `--kv-group-size` / `--qjl` are the only TurboQuant-specific flags;
-everything else (`--host`, `--port`, `--adapter-path`, `--max-tokens`, …) is
-handled by `mlx_lm.server`. Requires `mlx-lm>=0.31.3` (older versions use a single
-global generation stream that breaks under the server's worker threads).
+Or with the official OpenAI Python client:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="not-needed")
+resp = client.chat.completions.create(
+    model="./qwen3-tq4",                       # match the server's --model
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(resp.choices[0].message.content)
+```
+
+**Requires `mlx-lm>=0.31.3`** — the server runs each request in a worker thread,
+and older mlx-lm uses a single global generation stream that fails there
+(`RuntimeError: no Stream(gpu, 0)`); 0.31.3+ uses thread-local streams. (`pip
+install mlx-turboquant` pulls a compatible version automatically.) The stock
+`mlx_lm.server ...` also works for TurboQuant **weight** models if you call
+`mlx_turboquant.register()` in the process first — `turboquant serve` just does
+that for you and adds the KV-cache flags.
 
 ## Quantize the KV cache (long-context inference)
 
