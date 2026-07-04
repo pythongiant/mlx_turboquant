@@ -27,6 +27,7 @@ from __future__ import annotations
 from functools import lru_cache
 
 import mlx.core as mx
+import numpy as np
 
 __all__ = ["supported_hadamard_block", "signs_for", "rht", "rotate_rows"]
 
@@ -39,16 +40,19 @@ def _hadamard_ok(h: int) -> bool:
     them to an orthonormal transform under ``scale = 1/sqrt(h)`` (the norm is off
     by a constant factor).  Such sizes would break the ``R Rᵀ = I`` invariant, so
     we require actual norm preservation, not merely "does not throw".
+
+    Uses a numpy probe and a CPU stream so it is safe to call from worker threads
+    that have no default GPU stream (e.g. mlx-lm's threaded HTTP server).
     """
     if h < 1:
         return False
     try:
-        # Deterministic non-degenerate probe vector.
-        key = mx.random.key(0x5EED)
-        x = mx.random.normal(shape=(1, h), key=key)
-        y = mx.hadamard_transform(x, scale=1.0 / (h ** 0.5))
-        ratio = (mx.sum(y * y) / mx.sum(x * x)) ** 0.5
-        return bool(mx.abs(ratio - 1.0).item() < 1e-3)
+        x = mx.array(np.random.default_rng(0x5EED).standard_normal((1, h)).astype("float32"))
+        with mx.stream(mx.cpu):
+            y = mx.hadamard_transform(x, scale=1.0 / (h ** 0.5))
+            ratio = (mx.sum(y * y) / mx.sum(x * x)) ** 0.5
+            mx.eval(ratio)
+        return bool(abs(ratio.item() - 1.0) < 1e-3)
     except Exception:
         return False
 
@@ -84,12 +88,15 @@ def supported_hadamard_block(n: int) -> int:
 
 @lru_cache(maxsize=None)
 def signs_for(seed: int, n: int) -> mx.array:
-    """Deterministic ``±1`` diagonal ``d`` of length ``n`` for a given seed."""
-    key = mx.random.key(seed)
-    u = mx.random.uniform(shape=(n,), key=key)
-    d = mx.where(u < 0.5, mx.array(-1.0, dtype=mx.float32), mx.array(1.0, dtype=mx.float32))
-    mx.eval(d)
-    return d
+    """Deterministic ``±1`` diagonal ``d`` of length ``n`` for a given seed.
+
+    Generated with numpy's PCG64 (stable across platforms and MLX versions, and
+    thread-safe — no GPU stream needed), so the same rotation is reproduced at
+    convert time and at inference time, including inside worker threads.
+    """
+    rng = np.random.default_rng(seed)
+    d = np.where(rng.random(n) < 0.5, -1.0, 1.0).astype("float32")
+    return mx.array(d)
 
 
 def _block_hadamard(x: mx.array, block: int) -> mx.array:

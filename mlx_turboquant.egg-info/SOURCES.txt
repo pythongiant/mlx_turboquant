@@ -9,6 +9,7 @@ mlx_turboquant/convert.py
 mlx_turboquant/kv_cache.py
 mlx_turboquant/loader.py
 mlx_turboquant/patch.py
+mlx_turboquant/qjl.py
 mlx_turboquant/quant_linear.py
 mlx_turboquant/rotation.py
 mlx_turboquant.egg-info/PKG-INFO
@@ -18,9 +19,11 @@ mlx_turboquant.egg-info/entry_points.txt
 mlx_turboquant.egg-info/requires.txt
 mlx_turboquant.egg-info/top_level.txt
 mlx_turboquant/kernels/__init__.py
+mlx_turboquant/kernels/qjl_dot.py
 mlx_turboquant/kernels/qmm.py
 tests/test_codebook.py
 tests/test_kernels.py
 tests/test_kv_cache.py
+tests/test_qjl.py
 tests/test_quant_linear.py
 tests/test_rotation.py

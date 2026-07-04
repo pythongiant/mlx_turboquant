@@ -68,6 +68,52 @@ def _cmd_eval(args):
     runpy.run_path(str(bench), run_name="__main__")
 
 
+def _patch_server_kv(bits, group_size, qjl):
+    """Make mlx_lm.server build TurboQuant KV caches instead of plain KVCache."""
+    import mlx_lm.server as server
+
+    from .kv_cache import TurboQuantKVCache
+
+    def make_prompt_cache(model, *args, **kwargs):
+        return [
+            TurboQuantKVCache(group_size=group_size, bits=bits, qjl=qjl)
+            for _ in range(len(model.layers))
+        ]
+
+    server.make_prompt_cache = make_prompt_cache
+    print(
+        f"[turboquant] serving with TurboQuant KV cache "
+        f"(bits={bits}, group_size={group_size}, qjl={qjl})"
+    )
+
+
+def _cmd_serve(rest):
+    """`turboquant serve` — mlx_lm.server, made TurboQuant-aware.
+
+    Registers the load/attention hooks (so TurboQuant weight-quantized model dirs
+    load through the stock server), optionally swaps in the rotated TurboQuant KV
+    cache, then hands off to ``mlx_lm.server`` with all remaining flags.
+    """
+    p = argparse.ArgumentParser(prog="turboquant serve", add_help=False)
+    p.add_argument("--kv-bits", type=int, default=None, dest="kv_bits",
+                   help="Enable the TurboQuant rotated KV cache at this bit width.")
+    p.add_argument("--kv-group-size", type=int, default=64, dest="kv_group_size")
+    p.add_argument("--qjl", action="store_true",
+                   help="Use the unbiased 1-bit QJL residual KV estimator.")
+    known, passthrough = p.parse_known_args(rest)
+
+    from .patch import register
+
+    register()  # load_model + attention hooks (weight-quantized dirs just work)
+    if known.kv_bits is not None:
+        _patch_server_kv(known.kv_bits, known.kv_group_size, known.qjl)
+
+    import mlx_lm.server as server
+
+    sys.argv = ["mlx_lm.server"] + passthrough
+    server.main()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="turboquant", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -105,8 +151,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    # `serve` passes unknown flags straight through to mlx_lm.server, so handle
+    # it before the strict subparser.
+    if argv and argv[0] == "serve":
+        _cmd_serve(argv[1:])
+        return 0
     parser = build_parser()
-    args = parser.parse_args(argv if argv is not None else sys.argv[1:])
+    args = parser.parse_args(argv)
     args.func(args)
     return 0
 

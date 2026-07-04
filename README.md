@@ -58,6 +58,33 @@ or the CLI:
 turboquant generate --model ./qwen3-tq4 --prompt "Why is the sky blue?"
 ```
 
+## Serve (OpenAI-compatible HTTP API)
+
+`turboquant serve` wraps `mlx_lm.server`: it installs the TurboQuant hooks (so a
+TurboQuant-quantized model dir loads through the stock server) and, optionally,
+swaps in the rotated TurboQuant KV cache — then forwards every other flag to
+`mlx_lm.server`.
+
+```sh
+# Serve a TurboQuant weight-quantized model (all mlx_lm.server flags pass through)
+turboquant serve --model ./qwen3-tq4 --port 8080
+
+# ...plus the rotated 4-bit KV cache, with the unbiased 1-bit QJL residual
+turboquant serve --model ./qwen3-tq4 --port 8080 --kv-bits 4 --qjl
+```
+
+Then call it like any OpenAI endpoint:
+
+```sh
+curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model": "./qwen3-tq4", "messages": [{"role":"user","content":"Hello!"}]}'
+```
+
+`--kv-bits` / `--kv-group-size` / `--qjl` are the only TurboQuant-specific flags;
+everything else (`--host`, `--port`, `--adapter-path`, `--max-tokens`, …) is
+handled by `mlx_lm.server`. Requires `mlx-lm>=0.31.3` (older versions use a single
+global generation stream that breaks under the server's worker threads).
+
 ## Quantize the KV cache (long-context inference)
 
 The KV cache is applied at generation time to any (even unquantized) model:
