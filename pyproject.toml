@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-turboquant"
+version = "0.0.1"
+description = "TurboQuant data-oblivious rotation quantization for MLX-LM, with custom Metal kernels."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "mlx-turboquant contributors" }]
+keywords = ["mlx", "quantization", "llm", "apple-silicon", "metal", "turboquant"]
+dependencies = [
+    "mlx>=0.31.2; platform_system == 'Darwin'",
+    "mlx-lm>=0.28.0",
+    "numpy",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "datasets", "lm-eval"]
+
+[project.urls]
+Homepage = "https://github.com/mlx-community/mlx-turboquant"
+Paper = "https://arxiv.org/pdf/2504.19874"
+
+[project.scripts]
+turboquant = "mlx_turboquant.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["mlx_turboquant*"]

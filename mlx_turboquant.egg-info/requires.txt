@@ -1,0 +1,10 @@
+mlx-lm>=0.28.0
+numpy
+
+[:platform_system == "Darwin"]
+mlx>=0.31.2
+
+[test]
+pytest
+datasets
+lm-eval

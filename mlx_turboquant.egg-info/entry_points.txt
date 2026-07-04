@@ -1,0 +1,2 @@
+[console_scripts]
+turboquant = mlx_turboquant.cli:main

@@ -1,0 +1,153 @@
+Metadata-Version: 2.4
+Name: mlx-turboquant
+Version: 0.0.1
+Summary: TurboQuant data-oblivious rotation quantization for MLX-LM, with custom Metal kernels.
+Author: mlx-turboquant contributors
+License: MIT
+Project-URL: Homepage, https://github.com/mlx-community/mlx-turboquant
+Project-URL: Paper, https://arxiv.org/pdf/2504.19874
+Keywords: mlx,quantization,llm,apple-silicon,metal,turboquant
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: mlx>=0.31.2; platform_system == "Darwin"
+Requires-Dist: mlx-lm>=0.28.0
+Requires-Dist: numpy
+Provides-Extra: test
+Requires-Dist: pytest; extra == "test"
+Requires-Dist: datasets; extra == "test"
+Requires-Dist: lm-eval; extra == "test"
+Dynamic: license-file
+
+# mlx-turboquant
+
+A standalone, pip-installable **TurboQuant** adapter for
+[mlx-lm](https://github.com/ml-explore/mlx-lm) on Apple silicon, with a custom
+Metal kernel for non-uniform quantization.
+
+TurboQuant ([Zandieh, Daliri, Hadian, Mirrokni, 2025](https://arxiv.org/pdf/2504.19874))
+is a *data-oblivious* (calibration-free) vector quantizer. Its core trick is a
+**random rotation** (a Randomized Hadamard Transform): rotating a vector spreads
+outliers across coordinates and turns the marginal into a concentrated,
+near-Gaussian distribution that low-bit scalar quantizers handle gracefully.
+Crucially, an orthogonal rotation **preserves inner products**, so attention
+scores computed on rotated queries and keys are unchanged — which is what makes
+it so effective for KV-cache quantization.
+
+This adapter implements both regimes:
+
+- **Weights (MSE regime).** Rotate each weight matrix, then quantize. Rotation
+  is the robust, always-on win; you can quantize with MLX's fast affine
+  `quantized_matmul` (default) or with a custom **non-uniform Lloyd–Max LUT
+  Metal kernel** (`--mode lut`).
+- **KV cache (inner-product regime).** A drop-in `TurboQuantKVCache` that stores
+  keys in the rotated frame and rotates the query to match. This is where
+  TurboQuant shines (see numbers below).
+
+## Install
+
+```sh
+pip install mlx-turboquant        # from PyPI
+# or, from source:
+pip install -e .
+```
+
+Requires `mlx>=0.31.2` and `mlx-lm` on macOS/Apple silicon.
+
+## Quantize a model (weights)
+
+```sh
+turboquant convert --model mlx-community/Qwen3-0.6B-bf16 --out ./qwen3-tq4 --bits 4
+```
+
+Produces a standard mlx-lm model directory (safetensors + `config.json` with a
+`quantization_config` of `quant_method: turboquant`).
+
+## Run
+
+```python
+import mlx_turboquant as tq
+tq.register()                       # teach stock mlx-lm to load turboquant dirs
+from mlx_lm import load, generate
+model, tok = load("./qwen3-tq4")
+print(generate(model, tok, prompt="Why is the sky blue?", max_tokens=128, verbose=True))
+```
+
+or the CLI:
+
+```sh
+turboquant generate --model ./qwen3-tq4 --prompt "Why is the sky blue?"
+```
+
+## Quantize the KV cache (long-context inference)
+
+The KV cache is applied at generation time to any (even unquantized) model:
+
+```python
+import mlx_turboquant as tq
+from mlx_lm import load, generate
+model, tok = load("mlx-community/Qwen3-1.7B-bf16")
+cache = tq.make_prompt_cache(model, kv_bits=4, kv_group_size=64)   # rotated KV
+generate(model, tok, prompt=..., max_tokens=256, prompt_cache=cache, verbose=True)
+```
+
+## Measured results (`benchmarks/kv_quality.py`, Qwen3-0.6B, 509-token context)
+
+Teacher-forced perplexity with a quantized KV cache (lower is better):
+
+| KV bits | plain affine KV | **TurboQuant KV** |
+|--------:|----------------:|------------------:|
+| fp16    |    3.13 (ref)   |         —         |
+| 8       |    3.19         |     **3.12**      |
+| 4       |   31.09 💥      |     **5.10**      |
+| 3       |   23172         |     **2073**      |
+
+**At 4-bit, plain affine KV collapses while TurboQuant's rotation keeps it near
+usable** — the paper's headline claim, reproduced. (2-bit weight-*only* and
+≤3-bit KV break this tiny 0.6B model for both methods; use a larger model.)
+
+## The Metal kernel
+
+`mx.quantized_matmul` only supports *uniform/affine* codebooks. TurboQuant's
+MSE-optimal quantizer uses a **non-uniform Lloyd–Max codebook**, so
+`mlx_turboquant/kernels/qmm.py` is a hand-written `mx.fast.metal_kernel` that
+does LUT dequant + matmul directly on packed indices (one SIMD group reduces
+over `K` per output). It supports `bits ∈ {2,4,8}` and wins on weight
+reconstruction MSE at low bits (e.g. ~15% lower MSE than affine at 2-bit on a
+Gaussian source). Enable with `--mode lut`.
+
+**Honesty note:** at 4-bit, MLX's affine `quantized_matmul` is *data-adaptive*
+(per-group scale **and** bias), fast, and already near-lossless for weights, so
+the LUT does not beat it end-to-end there — and it is slower (naive v1 kernel).
+The LUT is provided for the low-bit / research-fidelity regime; the robust,
+default weight win is **rotation + affine**. The rotation itself runs on
+`mx.hadamard_transform` (Metal-accelerated).
+
+## How it plugs in
+
+- **Weights:** `nn.Linear → TurboQuantLinear` module swap (same pattern as
+  mlx-lm's `bitnet_quantize`). `register()` wraps `mlx_lm.utils.load_model` so
+  turboquant dirs load through the stock `mlx_lm.load` / `generate` / `server`.
+- **KV cache:** `TurboQuantKVCache` subclasses mlx-lm's `QuantizedKVCache`
+  (inherits all mask/state logic) and rotates keys; `register()` patches
+  `scaled_dot_product_attention` to rotate the query to match.
+
+## What's not (yet) implemented
+
+- The paper's optional **1-bit QJL residual** for a provably *unbiased*
+  inner-product estimator (this adapter ships the rotated MSE-quantized KV, the
+  robust core). Design notes are in `kv_cache.py`.
+- A fused RHT Metal kernel (we reuse MLX's already-optimized
+  `mx.hadamard_transform`).
+- 3-bit LUT packing (32 not divisible by 3).
+
+## Development
+
+```sh
+pip install -e ".[test]"
+pytest -q                 # rotation invariance, codebook MSE, kernel numerics, KV correctness
+python benchmarks/kv_quality.py --model mlx-community/Qwen3-0.6B-bf16
+python benchmarks/quality_proxy.py --bits 4
+```
+
+MIT licensed. Not affiliated with the TurboQuant authors or Apple.
