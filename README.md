@@ -148,7 +148,11 @@ smaller at matched quality** (and 3.5× smaller than fp16).
 ![KV cache memory vs context length](benchmarks/kv_memory.png)
 
 Measured on Qwen3-1.7B (`benchmarks/kv_memory.py` → `plot_kv_memory.py`); the
-ShareGPT prompt range is shaded, extrapolated to long context:
+ShareGPT prompt range is shaded, extrapolated to long context. **KB/token is
+measured directly** from the cache arrays (verified constant across 2k/4k/8k, and
+matching the throughput benchmark's independent 0.066 GB @2k), so the GB columns
+are *exact* linear scaling — not estimates. **ppl** is the quality proxy from
+`kv_quality.py` at 509-token context (not re-measured at 32k/128k):
 
 | KV config | quality (ppl) | KB/token | KV @ 32k | KV @ 128k |
 |---|--:|--:|--:|--:|
