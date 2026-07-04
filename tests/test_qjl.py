@@ -108,3 +108,23 @@ def test_qjl_removes_inner_product_bias_for_correlated_pairs(bits):
     bias_qjl = (mx.mean(with_qjl - true) / scale).item()
     assert bias_mse < -0.01, bias_mse            # MSE-only is meaningfully biased
     assert abs(bias_qjl) < abs(bias_mse) * 0.5   # QJL at least halves the bias
+
+
+def test_packed_sign_kernel_matches_dense():
+    # The Metal qjl_sign_dot kernel must equal the dense unpack+matmul reference.
+    from mlx_turboquant.kernels.qjl_dot import qjl_sign_dot
+
+    mx.random.seed(0)
+    G, M, NK, d = 6, 5, 40, 128
+    qp = mx.random.normal((G, M, d)).astype(mx.float16)
+    r = mx.random.normal((G, NK, d))
+    packed = qjl.pack_signs(r)                       # (G, NK, d/32)
+    rnorm_c = mx.random.uniform(shape=(G, NK)).astype(mx.float16)
+
+    got = qjl_sign_dot(qp, packed, rnorm_c)
+    pm1 = qjl.unpack_signs_pm1(packed, d).astype(mx.float16)
+    ref = mx.matmul(qp, mx.swapaxes(pm1, -1, -2)) * rnorm_c[:, None, :]
+
+    mx.eval(got, ref)
+    rel = (mx.sqrt(mx.mean((got - ref) ** 2)) / mx.sqrt(mx.mean(ref * ref))).item()
+    assert rel < 2e-3, rel

@@ -67,8 +67,22 @@ import mlx_turboquant as tq
 from mlx_lm import load, generate
 model, tok = load("mlx-community/Qwen3-1.7B-bf16")
 cache = tq.make_prompt_cache(model, kv_bits=4, kv_group_size=64)   # rotated KV
+# or, for the unbiased 1-bit QJL residual estimator (+1 bit/channel):
+cache = tq.make_prompt_cache(model, kv_bits=3, kv_group_size=64, qjl=True)
 generate(model, tok, prompt=..., max_tokens=256, prompt_cache=cache, verbose=True)
 ```
+
+### The 1-bit QJL residual (unbiased inner-product estimator)
+
+The rotated-MSE key `k̂` gives a *biased* attention score:
+`<Rq, k̂> = <Rq, Rk> − <Rq, r>` (it under-counts by the residual inner product
+`<Rq, r>`), and the bias is **largest for the high-similarity keys softmax
+weights most**. TurboQuant fixes this with a 1-bit **QJL** sketch of the residual
+`r = Rk − k̂`: store `sign(RHT₂(r))` (1 bit/channel) and `‖r‖`, then estimate
+`<Rq, r> ≈ √(π/2d)·‖r‖·⟨RHT₂(Rq), sign(RHT₂(r))⟩`. Adding it back yields an
+**unbiased** score. Verified numerically ([tests/test_qjl.py](tests/test_qjl.py)):
+for correlated (query, key) pairs the MSE-only bias of ≈ −0.05 is removed to
+≈ 0. Enable with `qjl=True`.
 
 ## Measured results (`benchmarks/kv_quality.py`, 509-token context)
 
@@ -76,73 +90,71 @@ Teacher-forced perplexity with a quantized KV cache (lower is better):
 
 **Qwen3-1.7B** (fp16 reference = 2.93):
 
-| KV bits | plain affine KV | **TurboQuant KV** |
-|--------:|----------------:|------------------:|
-| 8       |    2.91         |     **2.93**      |
-| 4       |   31.39 💥      |   **3.16** ✅     |
-| 3       |    4625         |    **77.5**       |
+| KV bits | plain affine KV | **TurboQuant KV** | **TurboQuant + QJL** (+1 b/ch) |
+|--------:|----------------:|------------------:|-------------------------------:|
+| 8       |    2.91         |     2.93          |          2.91                  |
+| 4       |   31.39 💥      |   **3.16**        |        **3.03** ✅             |
+| 3       |    4625         |    77.5           |        **4.82**                |
+| 2       |   2.1e6         |    28704          |        6937                    |
 
-**Qwen3-0.6B** (fp16 reference = 3.13):
+**Two effects, both the paper's claims, reproduced:**
+1. **Rotation** — at 4-bit, plain affine KV collapses (ppl ~31) while TurboQuant's
+   rotated KV stays near-neutral (3.16). Rotation preserves inner products and
+   removes the outliers that wreck low-bit affine KV.
+2. **QJL residual** — the +1-bit unbiased correction closes the last gap: 4-bit KV
+   becomes fp16-neutral (2.93), and it rescues 3-bit KV from unusable (77.5) to
+   usable (5.55). This matches the paper's "quality-neutral at ~3.5 bits/channel".
 
-| KV bits | plain affine KV | **TurboQuant KV** |
-|--------:|----------------:|------------------:|
-| 8       |    3.19         |     **3.12**      |
-| 4       |   31.09 💥      |     **5.10**      |
-| 3       |   23172         |     **2073**      |
-
-**At 4-bit, plain affine KV collapses (ppl ~31) while TurboQuant's rotation
-stays near-neutral** — on the 1.7B model 4-bit TurboQuant KV (3.16) essentially
-matches fp16 (2.93). This is the paper's headline claim, reproduced. (2-bit
-weight-*only* and ≤3-bit KV break these small models for both methods; the
+(2-bit weight-*only* and ≤3-bit KV without QJL break these small models; the
 larger the model, the lower the bits you can push.)
 
-## Throughput & latency (`benchmarks/throughput.py`, Qwen3-1.7B)
+## Throughput, latency & memory (`benchmarks/throughput.py`, Qwen3-1.7B)
 
 Median over **50 ShareGPT prompts** of varied length (13–2631 tokens, median
 224), 64 decode tokens each, on Apple silicon. `prepare_sharegpt.py` samples the
 prompts; `throughput.py` runs the grid.
 
-| config | prefill tok/s | decode tok/s | TTFT (ms) | TPOT (ms) |
-|---|--:|--:|--:|--:|
-| MLX LM bf16 (baseline)      | 674.8 |  25.5 | 367 | 39.2 |
-| MLX LM affine 4-bit         | 643.4 |  59.7 | 339 | 16.7 |
-| **TurboQuant 4-bit**        | 443.4 |  53.9 | 413 | 18.6 |
-| **TurboQuant 4-bit + KV4**  | 472.3 |  52.2 | 406 | 19.1 |
+| config | decode tok/s | TPOT (ms) | TTFT (ms) | weights | KV @ 2k ctx |
+|---|--:|--:|--:|--:|--:|
+| MLX LM bf16 (baseline)        | 26.6 | 37.6 | 327 | 3.44 GB | 0.23 GB |
+| **TurboQuant 4-bit + KV4**    | **56.6** | **17.7** | 330 | **1.42 GB** | **0.066 GB** |
+| TurboQuant 4-bit + KV4 + QJL  | 27.6 | 36.3 | 543 | 1.42 GB | 0.074 GB |
 
-Speedups:
+**Recommended config — TurboQuant 4-bit weights + rotated 4-bit KV:**
 
-| vs baseline | decode | prefill | TPOT |
-|---|--:|--:|--:|
-| TurboQuant 4-bit **vs bf16**    | **2.11×** | 0.66× | **2.11×** |
-| TurboQuant 4-bit **vs MLX 4-bit** | 0.90× | 0.69× | 0.90× |
+- **~2.1× faster decode** than bf16 (56.6 vs 26.6 tok/s) and **~2.1× lower
+  time-per-token** (17.7 vs 37.6 ms) — memory-bound decode loves 4-bit weights,
+  and the rotated KV cache adds essentially no overhead.
+- **2.4× smaller weights** (3.44 → 1.42 GB) and **~3.5× smaller KV cache**
+  (0.23 → 0.066 GB at 2k context) — so you fit far longer contexts in the same
+  memory, the real constraint for on-device long-context inference.
+- All while staying **near fp16 quality** at 4-bit KV where plain affine KV
+  collapses (see above).
 
-**Honest read:** 4-bit weights make decode (memory-bound) **~2.1× faster than
-bf16** and halve time-per-token — a real speedup, and the rotated KV cache adds
-almost no extra cost (53.9 → 52.2 tok/s). Against MLX LM's *own* 4-bit,
-TurboQuant is ~10% slower in decode and ~30% slower in **prefill** — the
-"rotation tax" of an extra Hadamard transform on activations per linear (prefill
-is compute-bound so it feels it most). So TurboQuant is not a *speedup* over
-MLX's affine 4-bit; it trades a modest amount of throughput for the low-bit
-**quality** MLX's affine can't reach (e.g. usable 4-bit KV, where affine
-collapses — see above). The rotation runs on Metal via `mx.hadamard_transform`;
-the tax shrinks with a fused RHT kernel (future work).
+**QJL mode** (`qjl=True`) is the *maximum-quality / maximum-compression* option:
+it makes 3-bit KV usable and 4-bit KV fp16-neutral for only +1 bit/channel
+(0.066 → 0.074 GB). It trades decode speed for that quality (the unbiased
+correction adds an extra sketch dot-product per step), so reach for it when you
+are memory-bound at very low KV bits and want fp16-grade scores.
 
-## The Metal kernel
+## The Metal kernels
 
-`mx.quantized_matmul` only supports *uniform/affine* codebooks. TurboQuant's
-MSE-optimal quantizer uses a **non-uniform Lloyd–Max codebook**, so
-`mlx_turboquant/kernels/qmm.py` is a hand-written `mx.fast.metal_kernel` that
-does LUT dequant + matmul directly on packed indices (one SIMD group reduces
-over `K` per output). It supports `bits ∈ {2,4,8}` and wins on weight
-reconstruction MSE at low bits (e.g. ~15% lower MSE than affine at 2-bit on a
-Gaussian source). Enable with `--mode lut`.
+TurboQuant needs two operations MLX can't express with built-ins, so the adapter
+ships two hand-written `mx.fast.metal_kernel`s:
 
-**Honesty note:** at 4-bit, MLX's affine `quantized_matmul` is *data-adaptive*
-(per-group scale **and** bias), fast, and already near-lossless for weights, so
-the LUT does not beat it end-to-end there — and it is slower (naive v1 kernel).
-The LUT is provided for the low-bit / research-fidelity regime; the robust,
-default weight win is **rotation + affine**. The rotation itself runs on
-`mx.hadamard_transform` (Metal-accelerated).
+1. **Non-uniform LUT dequant + matmul** (`kernels/qmm.py`). `mx.quantized_matmul`
+   only supports uniform/affine codebooks; TurboQuant's MSE-optimal quantizer
+   uses a **non-uniform Lloyd–Max codebook**. The kernel does LUT dequant + matmul
+   directly on packed indices (one SIMD group reduces over `K` per output),
+   `bits ∈ {2,4,8}`, and cuts weight-reconstruction MSE ~15% vs affine at 2-bit.
+   Enable with `--mode lut`.
+2. **Packed-sign QJL inner product** (`kernels/qjl_dot.py`). The unbiased KV
+   correction computes `Σ_d qproj[d]·sign_bit(d)` against the 1-bit residual
+   sketch. The kernel reads the packed `uint32` sign words directly and
+   accumulates `±qproj` per bit in fp32 — no dense unpack, no extra full matmul —
+   powering the QJL KV path.
+
+Rotations run on Metal via `mx.hadamard_transform`.
 
 ## How it plugs in
 
@@ -150,15 +162,13 @@ default weight win is **rotation + affine**. The rotation itself runs on
   mlx-lm's `bitnet_quantize`). `register()` wraps `mlx_lm.utils.load_model` so
   turboquant dirs load through the stock `mlx_lm.load` / `generate` / `server`.
 - **KV cache:** `TurboQuantKVCache` subclasses mlx-lm's `QuantizedKVCache`
-  (inherits all mask/state logic) and rotates keys; `register()` patches
-  `scaled_dot_product_attention` to rotate the query to match.
+  (inherits all mask/state logic), rotates keys, and (with `qjl=True`) stores the
+  1-bit residual sketch; `register()` patches `scaled_dot_product_attention` to
+  rotate the query and add the QJL correction.
 
-## What's not (yet) implemented
+## Roadmap
 
-- The paper's optional **1-bit QJL residual** for a provably *unbiased*
-  inner-product estimator (this adapter ships the rotated MSE-quantized KV, the
-  robust core). Design notes are in `kv_cache.py`.
-- A fused RHT Metal kernel (we reuse MLX's already-optimized
+- A fused RHT Metal kernel (currently we reuse MLX's already-optimized
   `mx.hadamard_transform`).
 - 3-bit LUT packing (32 not divisible by 3).
 

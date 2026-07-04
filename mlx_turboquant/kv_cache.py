@@ -92,6 +92,19 @@ class TurboQuantKVCache(QuantizedKVCache):
                 axis=2,
             )
 
+    @property
+    def nbytes(self):
+        from mlx.utils import tree_reduce
+
+        if self.keys is None:
+            return 0
+        total = tree_reduce(
+            lambda a, x: a + x.nbytes, (self.keys, self.values), 0
+        )
+        if self.qjl and self.sketch is not None:
+            total += self.sketch.nbytes + self.rnorm.nbytes
+        return total
+
     def update_and_fetch(self, keys, values):
         rk = self.rotate_key(keys)
         if not self.qjl:

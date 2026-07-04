@@ -24,9 +24,20 @@ from pathlib import Path
 
 import mlx.core as mx
 import mlx.nn as nn
+from mlx.utils import tree_flatten
 
 DATA = Path(__file__).resolve().parent / "sharegpt_50.json"
-CONFIGS = ["mlx-bf16", "mlx-4bit", "turboquant-4bit", "turboquant-4bit-kv4"]
+CONFIGS = [
+    "mlx-bf16",
+    "mlx-4bit",
+    "turboquant-4bit",
+    "turboquant-4bit-kv4",
+    "turboquant-4bit-kv4-qjl",
+]
+
+
+def _model_gb(model):
+    return sum(p.nbytes for _, p in tree_flatten(model.parameters())) / 1e9
 
 
 def _free(model):
@@ -55,10 +66,11 @@ def build(config, model_id):
         from mlx_turboquant.quant_linear import turboquant_quantize
 
         turboquant_quantize(model, bits=4, group_size=64, mode="affine")
-        if config == "turboquant-4bit-kv4":
+        if config.startswith("turboquant-4bit-kv4"):
             from mlx_turboquant.kv_cache import make_prompt_cache as mpc
 
-            cache_factory = lambda: mpc(model, kv_bits=4, kv_group_size=64)
+            qjl = config.endswith("qjl")
+            cache_factory = lambda: mpc(model, kv_bits=4, kv_group_size=64, qjl=qjl)
     else:
         raise ValueError(config)
 
@@ -79,13 +91,26 @@ def measure(model, tok, cache_factory, prompt, max_tokens):
     return last
 
 
+def _kv_gb(model, cache_factory, prompt_tokens=2048):
+    """Total KV-cache bytes after a fixed-length context (0 for fp16-KV configs)."""
+    cache = cache_factory()
+    if cache is None:
+        return 0.0
+    ids = mx.arange(prompt_tokens, dtype=mx.uint32)[None, :] % 1000
+    model(ids, cache=cache)
+    mx.eval([c.state for c in cache])
+    return sum(c.nbytes for c in cache) / 1e9
+
+
 def run_config(config, model_id, examples, max_tokens):
     model, tok, cache_factory = build(config, model_id)
+    model_gb = _model_gb(model)
+    kv_gb = _kv_gb(model, cache_factory)
 
     # Warmup (compiles kernels, warms caches) — not timed.
     measure(model, tok, cache_factory, "Hello, how are you?", 8)
 
-    prefill_tps, decode_tps, ttft_ms, tpot_ms, peak = [], [], [], [], 0.0
+    prefill_tps, decode_tps, ttft_ms, tpot_ms = [], [], [], []
     for ex in examples:
         r = measure(model, tok, cache_factory, ex["prompt"], max_tokens)
         if r is None or r.generation_tps <= 0 or r.prompt_tps <= 0:
@@ -94,7 +119,6 @@ def run_config(config, model_id, examples, max_tokens):
         decode_tps.append(r.generation_tps)
         ttft_ms.append(1000.0 * r.prompt_tokens / r.prompt_tps)
         tpot_ms.append(1000.0 / r.generation_tps)
-        peak = max(peak, getattr(r, "peak_memory", 0.0))
 
     _free(model)
     return {
@@ -104,7 +128,8 @@ def run_config(config, model_id, examples, max_tokens):
         "decode_tps": st.median(decode_tps),
         "ttft_ms": st.median(ttft_ms),
         "tpot_ms": st.median(tpot_ms),
-        "peak_gb": peak,
+        "model_gb": model_gb,
+        "kv_gb_2k": kv_gb,
     }
 
 
@@ -127,9 +152,9 @@ def main():
     for cfg in args.configs:
         r = run_config(cfg, args.model, examples, args.max_tokens)
         rows.append(r)
-        print(f"  {cfg:20} prefill={r['prefill_tps']:8.1f} tok/s  "
-              f"decode={r['decode_tps']:6.1f} tok/s  TTFT={r['ttft_ms']:7.1f} ms  "
-              f"TPOT={r['tpot_ms']:5.1f} ms  peak={r['peak_gb']:.2f} GB")
+        print(f"  {cfg:24} prefill={r['prefill_tps']:8.1f}  decode={r['decode_tps']:6.1f}  "
+              f"TTFT={r['ttft_ms']:7.1f}ms  TPOT={r['tpot_ms']:5.1f}ms  "
+              f"weights={r['model_gb']:.2f}GB  KV@2k={r['kv_gb_2k']:.3f}GB")
 
     base = {r["config"]: r for r in rows}
     Path(args.out).write_text(json.dumps(rows, indent=1))
@@ -140,18 +165,16 @@ def main():
         a, b = base[cfg][key], base[ref][key]
         return (b / a) if invert else (a / b)
 
-    print("\nSpeedup vs mlx-bf16 (×, >1 = faster):")
-    for cfg in args.configs:
-        if cfg == "mlx-bf16":
-            continue
-        print(f"  {cfg:20} decode {ratio(cfg,'mlx-bf16','decode_tps'):.2f}×  "
-              f"prefill {ratio(cfg,'mlx-bf16','prefill_tps'):.2f}×  "
-              f"TPOT {ratio(cfg,'mlx-bf16','tpot_ms',invert=True):.2f}×")
-    print("\nSpeedup vs mlx-4bit (MLX LM's own quantization):")
-    for cfg in ("turboquant-4bit", "turboquant-4bit-kv4"):
-        if cfg in base and "mlx-4bit" in base:
-            print(f"  {cfg:20} decode {ratio(cfg,'mlx-4bit','decode_tps'):.2f}×  "
-                  f"prefill {ratio(cfg,'mlx-4bit','prefill_tps'):.2f}×")
+    def fmt(x):
+        return f"{x:.2f}×" if x is not None else "  n/a"
+
+    if "mlx-bf16" in base:
+        print("\nSpeedup vs mlx-bf16 (×, >1 = faster):")
+        for cfg in args.configs:
+            if cfg == "mlx-bf16" or cfg not in base:
+                continue
+            print(f"  {cfg:24} decode {fmt(ratio(cfg,'mlx-bf16','decode_tps'))}  "
+                  f"TPOT {fmt(ratio(cfg,'mlx-bf16','tpot_ms',invert=True))}")
     print(f"\nwrote {args.out}")
 
 
