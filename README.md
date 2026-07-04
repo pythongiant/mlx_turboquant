@@ -137,6 +137,32 @@ it makes 3-bit KV usable and 4-bit KV fp16-neutral for only +1 bit/channel
 correction adds an extra sketch dot-product per step), so reach for it when you
 are memory-bound at very low KV bits and want fp16-grade scores.
 
+### Memory footprint over long context
+
+The KV cache — not the weights — is what grows with context and dominates memory
+for long sequences. Since MLX's affine KV is unusable at 4-bit (ppl ~31), the
+honest comparison is **iso-quality**: to stay near fp16, affine needs **8-bit**
+KV while TurboQuant is neutral at **4-bit**, so TurboQuant's KV cache is **~1.9×
+smaller at matched quality** (and 3.5× smaller than fp16).
+
+![KV cache memory vs context length](benchmarks/kv_memory.png)
+
+Measured on Qwen3-1.7B (`benchmarks/kv_memory.py` → `plot_kv_memory.py`); the
+ShareGPT prompt range is shaded, extrapolated to long context:
+
+| KV config | quality (ppl) | KB/token | KV @ 32k | KV @ 128k |
+|---|--:|--:|--:|--:|
+| fp16                        | 2.93   | 112.0 | 3.76 GB | 15.0 GB |
+| MLX affine 8-bit            | 2.91   |  59.5 | 2.00 GB |  8.0 GB |
+| MLX affine 4-bit            | 31.4 ✗ |  31.5 | 1.06 GB |  4.2 GB |
+| **TurboQuant 4-bit**        | **3.16** | 31.5 | **1.06 GB** | **4.2 GB** |
+| **TurboQuant 3-bit + QJL**  | **4.82** | 28.4 | 0.95 GB |  3.8 GB |
+
+TurboQuant 4-bit uses the *same* bytes as affine 4-bit but is actually usable
+(3.16 vs 31.4). At 128k context that's a **4.2 GB KV cache instead of 8 GB
+(affine, matched quality) or 15 GB (fp16)** — often the difference between
+fitting long context on-device or not.
+
 ## The Metal kernels
 
 TurboQuant needs two operations MLX can't express with built-ins, so the adapter
@@ -176,9 +202,10 @@ Rotations run on Metal via `mx.hadamard_transform`.
 
 ```sh
 pip install -e ".[test]"
-pytest -q                 # rotation invariance, codebook MSE, kernel numerics, KV correctness
-python benchmarks/kv_quality.py --model mlx-community/Qwen3-0.6B-bf16
-python benchmarks/quality_proxy.py --bits 4
+pytest -q                 # rotation invariance, codebook MSE, kernel numerics, KV + QJL correctness
+python benchmarks/kv_quality.py  --model mlx-community/Qwen3-0.6B-bf16   # KV perplexity
+python benchmarks/throughput.py  --model mlx-community/Qwen3-1.7B-bf16   # TPOT/TTFT over ShareGPT
+python benchmarks/kv_memory.py && python benchmarks/plot_kv_memory.py    # memory chart
 ```
 
 MIT licensed. Not affiliated with the TurboQuant authors or Apple.

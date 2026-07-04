@@ -1,0 +1,43 @@
+{
+ "model": "mlx-community/Qwen3-1.7B-bf16",
+ "n_layers": 28,
+ "n_kv_heads": 8,
+ "head_dim": 128,
+ "configs": [
+  {
+   "label": "fp16 KV",
+   "note": "exact",
+   "ppl": 2.93,
+   "bytes_per_token": 114688.0,
+   "bits_per_channel": 16.0
+  },
+  {
+   "label": "MLX affine 8-bit",
+   "note": "neutral",
+   "ppl": 2.91,
+   "bytes_per_token": 60928.0,
+   "bits_per_channel": 8.5
+  },
+  {
+   "label": "MLX affine 4-bit",
+   "note": "broken",
+   "ppl": 31.4,
+   "bytes_per_token": 32256.0,
+   "bits_per_channel": 4.5
+  },
+  {
+   "label": "TurboQuant 4-bit",
+   "note": "neutral",
+   "ppl": 3.16,
+   "bytes_per_token": 32256.0,
+   "bits_per_channel": 4.5
+  },
+  {
+   "label": "TurboQuant 3-bit + QJL",
+   "note": "usable",
+   "ppl": 4.82,
+   "bytes_per_token": 29120.0,
+   "bits_per_channel": 4.0625
+  }
+ ]
+}
